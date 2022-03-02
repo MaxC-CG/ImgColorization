@@ -1,15 +1,14 @@
-from numpy import ndarray
+from fastai.basic_data import DatasetType
+from fastai.basic_train import Learner
 from abc import ABC, abstractmethod
-from .critics import colorize_crit_learner
 from fastai.core import *
 from fastai.vision import *
 from fastai.vision.image import *
 from fastai.vision.data import *
 from fastai import *
-import math
-from scipy import misc
 import cv2
 from PIL import Image as PilImage
+from deoldify import device as device_settings
 
 
 class IFilter(ABC):
@@ -21,9 +20,14 @@ class IFilter(ABC):
 
 
 class BaseFilter(IFilter):
-    def __init__(self, learn: Learner, stats:tuple = imagenet_stats):
+    def __init__(self, learn: Learner, stats: tuple = imagenet_stats):
         super().__init__()
         self.learn = learn
+        
+        if not device_settings.is_gpu():
+            self.learn.model = self.learn.model.cpu()
+        
+        self.device = next(self.learn.model.parameters()).device
         self.norm, self.denorm = normalize_funcs(*stats)
 
     def _transform(self, image: PilImage) -> PilImage:
@@ -43,11 +47,20 @@ class BaseFilter(IFilter):
     def _model_process(self, orig: PilImage, sz: int) -> PilImage:
         model_image = self._get_model_ready_image(orig, sz)
         x = pil2tensor(model_image, np.float32)
+        x = x.to(self.device)
         x.div_(255)
         x, y = self.norm((x, x), do_x=True)
-        result = self.learn.pred_batch(
-            ds_type=DatasetType.Valid, batch=(x[None].cuda(), y[None]), reconstruct=True
-        )
+        
+        try:
+            result = self.learn.pred_batch(
+                ds_type=DatasetType.Valid, batch=(x[None], y[None]), reconstruct=True
+            )
+        except RuntimeError as rerr:
+            if 'memory' not in str(rerr):
+                raise rerr
+            print('Warning: render_factor was set too high, and out of memory error resulted. Returning original image.')
+            return model_image
+            
         out = result[0]
         out = self.denorm(out.px, do_x=False)
         out = image2np(out * 255).astype(np.uint8)
@@ -60,48 +73,32 @@ class BaseFilter(IFilter):
 
 
 class ColorizerFilter(BaseFilter):
-    def __init__(self, learn: Learner, stats: tuple = imagenet_stats, map_to_orig: bool = True):
+    def __init__(self, learn: Learner, stats: tuple = imagenet_stats):
         super().__init__(learn=learn, stats=stats)
         self.render_base = 16
-        self.map_to_orig = map_to_orig
 
     def filter(
-        self, orig_image: PilImage, filtered_image: PilImage, render_factor: int,post_process: bool = False
-    ) -> PilImage:
+        self, orig_image: PilImage, filtered_image: PilImage, render_factor: int, post_process: bool = True) -> PilImage:
         render_sz = render_factor * self.render_base
         model_image = self._model_process(orig=filtered_image, sz=render_sz)
+        raw_color = self._unsquare(model_image, orig_image)
 
-        if self.map_to_orig:
-            return self._post_process(model_image, orig_image, post_process )
+        if post_process:
+            return self._post_process(raw_color, orig_image)
         else:
-            return self._post_process(model_image, filtered_image, post_process)
+            return raw_color
 
     def _transform(self, image: PilImage) -> PilImage:
         return image.convert('LA').convert('RGB')
-
-    def add_intensity(self, img, intensity=1.7):
-        if intensity==1:
-            return img
-        inter_const = 255. **(1-intensity)
-        return (inter_const * (img**intensity)).astype(np.uint8)
 
     # This takes advantage of the fact that human eyes are much less sensitive to
     # imperfections in chrominance compared to luminance.  This means we can
     # save a lot on memory and processing in the model, yet get a great high
     # resolution result at the end.  This is primarily intended just for
     # inference
-    def _post_process(self, raw_color: PilImage, orig: PilImage, post_process: bool) -> PilImage:
-        raw_color = self._unsquare(raw_color, orig)
+    def _post_process(self, raw_color: PilImage, orig: PilImage) -> PilImage:
         color_np = np.asarray(raw_color)
         orig_np = np.asarray(orig)
-        if not post_process:
-            color = self.add_intensity(color_np)
-
-            blurred = cv2.GaussianBlur(orig_np, (5,5),1)
-            res_blur = cv2.addWeighted(orig_np, 0.75,blurred , 0.25, 0)
-            color = cv2.addWeighted(res_blur, 0.5, color, 0.5, 0)
-            combined = self.add_intensity(color, intensity=0.9)
-            return PilImage.fromarray(combined)
         color_yuv = cv2.cvtColor(color_np, cv2.COLOR_BGR2YUV)
         # do a black and white transform first to get better luminance values
         orig_yuv = cv2.cvtColor(orig_np, cv2.COLOR_BGR2YUV)
@@ -113,13 +110,12 @@ class ColorizerFilter(BaseFilter):
 
 
 class MasterFilter(BaseFilter):
-    def __init__(self, filters: [IFilter], render_factor: int):
+    def __init__(self, filters: List[IFilter], render_factor: int):
         self.filters = filters
         self.render_factor = render_factor
 
     def filter(
-        self, orig_image: PilImage, filtered_image: PilImage, render_factor: int = None,post_process: bool = False
-    ) -> PilImage:
+        self, orig_image: PilImage, filtered_image: PilImage, render_factor: int = None, post_process: bool = True) -> PilImage:
         render_factor = self.render_factor if render_factor is None else render_factor
         for filter in self.filters:
             filtered_image = filter.filter(orig_image, filtered_image, render_factor, post_process)

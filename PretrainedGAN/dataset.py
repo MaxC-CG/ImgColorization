@@ -1,9 +1,7 @@
-import fastai
 from fastai import *
 from fastai.core import *
 from fastai.vision.transform import get_transforms
 from fastai.vision.data import ImageImageList, ImageDataBunch, imagenet_stats
-from .augs import noisify
 
 
 def get_colorize_data(
@@ -41,8 +39,8 @@ def get_colorize_data(
     return data
 
 
-def get_dummy_databunch(stats=imagenet_stats) -> ImageDataBunch:
+def get_dummy_databunch() -> ImageDataBunch:
     path = Path('./dummy/')
     return get_colorize_data(
-        sz=1, bs=1, crappy_path=path, good_path=path, stats=stats,keep_pct=0.001
+        sz=1, bs=1, crappy_path=path, good_path=path, keep_pct=0.001
     )
